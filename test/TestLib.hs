@@ -1,5 +1,6 @@
 {-# OPTIONS_GHC -fno-warn-type-defaults -fno-warn-orphans #-}
 {-# LANGUAGE TupleSections #-}
+{-# LANGUAGE OverloadedLists #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
@@ -8,6 +9,7 @@
 
 module TestLib where
 
+import           Control.Concurrent.MVar
 import           Data.Bifunctor
 import           Data.Binary.Get
 import qualified Data.ByteString.Lazy as L
@@ -16,14 +18,27 @@ import qualified Data.HashMap.Strict as HM
 import           Data.Int
 import           Data.List
 import           Data.Maybe
+import           GHC.Stack
 import           Prana.Decode
+import           Prana.Interpret
 import           Prana.Types
 import           System.Exit
 import           System.IO.Temp
+import           System.IO.Unsafe (unsafePerformIO)
 import           System.Process
 
 deriving instance Num LocalVarId
 deriving instance Num GlobalVarId
+
+evalCode :: Exp -> [(String, String)] -> IO WHNF
+evalCode expr code = do
+  (idmod, methods) <- compileModulesWith Normal code
+  let (env, local) = link idmod methods
+  evalExp env local expr
+
+ignoreEnv :: WHNF -> WHNF
+ignoreEnv (ConW ci _) = ConW ci []
+ignoreEnv w = w
 
 data CompileType = Normal
 
@@ -118,8 +133,11 @@ dropModuleHeaders = map (second (filter (not . header)))
                  }) = True
     header _ = False
 
-link :: [(String, [Bind])] -> (HashMap Int64 Exp, HashMap Int64 Exp)
-link mods = (globals, locals)
+link
+  :: [(String, [Bind])]
+  -> [(MethodId, Int64)]
+  -> (Env, LocalEnv)
+link mods methods = (Env globals methodsMap, locals)
   where
     bs = concatMap snd mods
     globals =
@@ -127,7 +145,7 @@ link mods = (globals, locals)
         (mapMaybe
            (\b ->
               case bindVar b of
-                ExportedIndex (GlobalVarId i) -> Just (i, bindExp b)
+                ExportedIndex i -> Just (i, mkThunkRef b)
                 _ -> Nothing)
            bs)
     locals =
@@ -135,9 +153,21 @@ link mods = (globals, locals)
         (mapMaybe
            (\b ->
               case bindVar b of
-                LocalIndex (LocalVarId i) -> Just (i, bindExp b)
+                LocalIndex i -> Just (i, mkThunkRef b)
                 _ -> Nothing)
            bs)
+    methodsMap = HM.fromList $ zipWith (\i (_, x) -> (MethId i, x)) [0..] methods
+    -- ¯\_(ツ)_/¯ Safety third! ¯\_(ツ)_/¯
+    mkThunkRef =
+      unsafePerformIO . fmap ValueRef . newMVar . Thunk locals . bindExp
 
-linkMethods :: [(MethodId, Int64)] -> HashMap Int64 Int64
-linkMethods = HM.fromList . zipWith (\i (_, x) -> (i,x)) [0..]
+deref :: HasCallStack => ValueRef -> Value
+deref (ValueRef var) = unsafePerformIO $ do
+  mval <- tryReadMVar var
+  case mval of
+    Just val -> return val
+    Nothing ->
+      error $ unwords
+        [ "Expected to dereference a Value, but the MVar is empty"
+        , "(typically indicating in progress evaluation)"
+        ]
